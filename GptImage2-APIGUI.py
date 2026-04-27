@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import urllib.request
+from email.message import Message
 from urllib.parse import urlparse, urlunparse
 from dataclasses import dataclass
 from datetime import datetime
@@ -182,13 +183,16 @@ def _normalize_base_url(base_url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, new_path, "", "", ""))
 
 
-def _download_url_bytes(url: str, timeout_s: int = 60) -> bytes:
+def _download_url_bytes(url: str, timeout_s: int = 60) -> tuple[bytes, str | None]:
     url = (url or "").strip()
     if not url:
         raise RuntimeError("Empty url in provider response item.")
     req = urllib.request.Request(url, headers={"User-Agent": "GptImage2-APIGUI/1.0"})
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec - URL comes from provider response
-        return resp.read()
+        body = resp.read()
+        headers: Message | None = getattr(resp, "headers", None)
+        content_type = headers.get_content_type() if headers else None
+        return body, content_type
 
 
 def _b64decode_relaxed(data: str) -> bytes:
@@ -205,6 +209,32 @@ def _b64decode_relaxed(data: str) -> bytes:
     if pad:
         s = s + ("=" * pad)
     return base64.b64decode(s)
+
+
+def _guess_image_ext(data: bytes) -> str | None:
+    """
+    Guess image extension by magic bytes.
+    Returns extension including dot (e.g. ".png") or None if unknown.
+    """
+    if not data or len(data) < 12:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return ".gif"
+    # WEBP: RIFF....WEBP
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _looks_like_html(data: bytes) -> bool:
+    if not data:
+        return False
+    head = data[:200].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<head" in head
 
 
 @dataclass
@@ -753,24 +783,52 @@ class App:
             saved: list[str] = []
             for i, item in enumerate(items):
                 img_bytes: bytes | None = None
+                ext: str | None = None
+
+                # 1) Prefer b64_json
+                b64_ok = False
                 try:
                     b64 = self._extract_b64_from_item(item)
-                    img_bytes = _b64decode_relaxed(b64)
+                    candidate = _b64decode_relaxed(b64)
+                    ext = _guess_image_ext(candidate)
+                    if ext:
+                        img_bytes = candidate
+                        b64_ok = True
                 except Exception:
-                    url = self._extract_url_from_item(item)
-                    if url:
-                        img_bytes = _download_url_bytes(url)
-                    else:
-                        raise
+                    b64_ok = False
 
-                name = _default_filename(params.filename_prefix, ".png")
+                # 2) Fall back to url download if base64 missing/invalid/unknown
+                if not b64_ok:
+                    url = self._extract_url_from_item(item)
+                    if not url:
+                        raise RuntimeError(f"Provider response item has no usable image payload. item={str(item)[:300]}")
+                    body, content_type = _download_url_bytes(url)
+                    if _looks_like_html(body):
+                        snippet = body[:300].decode("utf-8", errors="replace")
+                        raise RuntimeError(
+                            "Downloaded image url returned HTML instead of an image. "
+                            f"content_type={content_type} url={url} body_preview={snippet}"
+                        )
+                    ext = _guess_image_ext(body)
+                    if not ext:
+                        preview = body[:80]
+                        raise RuntimeError(
+                            "Downloaded image url returned unknown/unsupported binary. "
+                            f"content_type={content_type} url={url} head_bytes={preview!r}"
+                        )
+                    img_bytes = body
+
+                if not img_bytes:
+                    raise RuntimeError("Provider returned empty image bytes.")
+
+                name = _default_filename(params.filename_prefix, ext or ".png")
                 if params.n > 1:
                     # Keep stable naming for multiple images in one run
                     stem = Path(name).with_suffix("").name
-                    name = f"{stem}_{i+1}.png"
+                    name = f"{stem}_{i+1}{Path(name).suffix}"
 
                 out_path = _next_available_path(params.out_dir / name)
-                out_path.write_bytes(img_bytes or b"")
+                out_path.write_bytes(img_bytes)
                 saved.append(str(out_path))
 
             session_hint = ""
