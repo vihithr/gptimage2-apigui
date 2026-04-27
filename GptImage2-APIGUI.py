@@ -191,6 +191,22 @@ def _download_url_bytes(url: str, timeout_s: int = 60) -> bytes:
         return resp.read()
 
 
+def _b64decode_relaxed(data: str) -> bytes:
+    """
+    Decode base64 that may be missing padding or contain whitespace.
+    Some providers return non-padded base64 for image bytes.
+    """
+    s = (data or "").strip()
+    if not s:
+        raise ValueError("Empty base64 data")
+    s = "".join(s.split())
+    # Fix missing padding
+    pad = (-len(s)) % 4
+    if pad:
+        s = s + ("=" * pad)
+    return base64.b64decode(s)
+
+
 @dataclass
 class GenerateParams:
     api_key: str
@@ -739,7 +755,7 @@ class App:
                 img_bytes: bytes | None = None
                 try:
                     b64 = self._extract_b64_from_item(item)
-                    img_bytes = base64.b64decode(b64)
+                    img_bytes = _b64decode_relaxed(b64)
                 except Exception:
                     url = self._extract_url_from_item(item)
                     if url:
