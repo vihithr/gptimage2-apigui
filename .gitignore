@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local config (may contain secrets)
+config.json
+
+# Runtime outputs
+logs/
+sessions/
+image/
+Pic_generate/
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
