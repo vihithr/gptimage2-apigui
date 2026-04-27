@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import threading
+from urllib.parse import urlparse, urlunparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -149,6 +150,35 @@ def _default_filename(prefix: str, ext: str = ".png") -> str:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     prefix = prefix.strip() or "image"
     return f"{prefix}_{ts}{ext}"
+
+
+def _normalize_base_url(base_url: str) -> str:
+    """
+    Normalize a provider base_url to an OpenAI-compatible API root.
+
+    Many providers require the base url to end with `/v1`. If the user pastes
+    a bare host (e.g. https://api.example.com) it often returns an HTML page
+    instead of JSON. This function appends `/v1` when it looks missing.
+    """
+    base_url = (base_url or "").strip()
+    if not base_url:
+        return base_url
+
+    # Trim trailing slashes but preserve scheme/host.
+    base_url = base_url.rstrip("/")
+
+    parsed = urlparse(base_url)
+    # If user entered only host without scheme, keep as-is and let SDK error.
+    if not parsed.scheme or not parsed.netloc:
+        return base_url
+
+    path = (parsed.path or "").rstrip("/")
+    if path.endswith("/v1") or path == "/v1":
+        new_path = path
+    else:
+        new_path = (path + "/v1") if path else "/v1"
+
+    return urlunparse((parsed.scheme, parsed.netloc, new_path, "", "", ""))
 
 
 @dataclass
@@ -544,7 +574,7 @@ class App:
         if not api_key:
             raise ValueError("Missing API key (set OPENAI_API_KEY or paste it here).")
 
-        base_url = self.base_url_var.get().strip()
+        base_url = _normalize_base_url(self.base_url_var.get().strip())
         model = self.model_var.get().strip() or "gpt-image-2"
         quality = self.quality_var.get().strip().lower() or "high"
         size = self.size_var.get().strip() or "1024x1024"
@@ -619,6 +649,13 @@ class App:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
                 snippet = text[:300]
+                lower = snippet.lstrip().lower()
+                if lower.startswith("<!doctype html") or lower.startswith("<html") or "<head" in lower:
+                    raise RuntimeError(
+                        "Provider returned HTML instead of JSON. This usually means your `base_url` is not an API endpoint "
+                        "(often missing `/v1`), or the request was redirected to a website/login page, or the provider rejected "
+                        f"the request. Response preview: {snippet}"
+                    )
                 raise RuntimeError(f"Provider returned non-JSON string response: {snippet}")
             if isinstance(parsed, dict):
                 if parsed.get("error"):
