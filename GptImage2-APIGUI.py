@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import threading
+import urllib.request
 from urllib.parse import urlparse, urlunparse
 from dataclasses import dataclass
 from datetime import datetime
@@ -179,6 +180,15 @@ def _normalize_base_url(base_url: str) -> str:
         new_path = (path + "/v1") if path else "/v1"
 
     return urlunparse((parsed.scheme, parsed.netloc, new_path, "", "", ""))
+
+
+def _download_url_bytes(url: str, timeout_s: int = 60) -> bytes:
+    url = (url or "").strip()
+    if not url:
+        raise RuntimeError("Empty url in provider response item.")
+    req = urllib.request.Request(url, headers={"User-Agent": "GptImage2-APIGUI/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec - URL comes from provider response
+        return resp.read()
 
 
 @dataclass
@@ -683,6 +693,15 @@ class App:
             raise RuntimeError(f"No b64_json found in response item. item={item_preview}")
         return b64
 
+    def _extract_url_from_item(self, item: object) -> str | None:
+        if hasattr(item, "url"):
+            url = getattr(item, "url")
+        elif isinstance(item, dict):
+            url = item.get("url")
+        else:
+            url = None
+        return url if isinstance(url, str) and url.strip() else None
+
     def _generate_worker(self, params: GenerateParams, should_open_out: bool, should_record_session: bool) -> None:
         try:
             _safe_mkdir(params.out_dir)
@@ -698,6 +717,7 @@ class App:
                         n=params.n,
                         quality=params.quality,
                         image=opened_files,
+                        response_format="b64_json",
                     )
                 finally:
                     for f in opened_files:
@@ -710,13 +730,22 @@ class App:
                     n=params.n,
                     quality=params.quality,
                     size=params.size,
+                    response_format="b64_json",
                 )
 
             items = self._extract_response_items(resp)
             saved: list[str] = []
             for i, item in enumerate(items):
-                b64 = self._extract_b64_from_item(item)
-                img_bytes = base64.b64decode(b64)
+                img_bytes: bytes | None = None
+                try:
+                    b64 = self._extract_b64_from_item(item)
+                    img_bytes = base64.b64decode(b64)
+                except Exception:
+                    url = self._extract_url_from_item(item)
+                    if url:
+                        img_bytes = _download_url_bytes(url)
+                    else:
+                        raise
 
                 name = _default_filename(params.filename_prefix, ".png")
                 if params.n > 1:
@@ -725,7 +754,7 @@ class App:
                     name = f"{stem}_{i+1}.png"
 
                 out_path = _next_available_path(params.out_dir / name)
-                out_path.write_bytes(img_bytes)
+                out_path.write_bytes(img_bytes or b"")
                 saved.append(str(out_path))
 
             session_hint = ""
