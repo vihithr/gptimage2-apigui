@@ -211,6 +211,68 @@ def _b64decode_relaxed(data: str) -> bytes:
     return base64.b64decode(s)
 
 
+def _split_data_url(data: str) -> tuple[str | None, str]:
+    """
+    Split a data URL like:
+      data:image/png;base64,AAAA...
+    Returns (mime, payload_string). If not a data URL, mime is None and payload is original.
+    """
+    s = (data or "").strip()
+    if not s.lower().startswith("data:"):
+        return None, s
+
+    # Minimal data URL parsing: data:[<mime>][;base64],<payload>
+    comma = s.find(",")
+    if comma < 0:
+        # Malformed, treat as raw string
+        return None, s
+    meta = s[5:comma]  # after "data:"
+    payload = s[comma + 1 :]
+    mime = None
+    if meta:
+        mime = meta.split(";")[0].strip() or None
+    return mime, payload
+
+
+def _mime_to_ext(mime: str | None) -> str | None:
+    if not mime:
+        return None
+    m = mime.lower().strip()
+    if m == "image/png":
+        return ".png"
+    if m in ("image/jpeg", "image/jpg"):
+        return ".jpg"
+    if m == "image/gif":
+        return ".gif"
+    if m == "image/webp":
+        return ".webp"
+    return None
+
+
+def _is_plausible_base64(data: str) -> bool:
+    """
+    Fast, conservative base64 sanity check to avoid expensive decoding on
+    obviously-invalid payloads.
+    """
+    mime, s = _split_data_url(data)
+    s = (s or "").strip()
+    if not s:
+        return False
+    # Remove whitespace cheaply
+    s = "".join(s.split())
+    # If len % 4 == 1, base64 is impossible (even with padding).
+    if (len(s) % 4) == 1:
+        return False
+    # Quick character check (allow padding '=' only at the end).
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+    # Only sample up to a point to keep this O(1) for huge strings.
+    sample = s[:2048]
+    for ch in sample:
+        if ch not in allowed:
+            return False
+    return True
+
+
 def _guess_image_ext(data: bytes) -> str | None:
     """
     Guess image extension by magic bytes.
@@ -752,6 +814,7 @@ class App:
         try:
             _safe_mkdir(params.out_dir)
             client = OpenAI(api_key=params.api_key, base_url=params.base_url)
+            self.root.after(0, lambda: self.status_var.set("Generating... (waiting for provider response)"))
 
             if params.images:
                 # image-to-image
@@ -784,24 +847,35 @@ class App:
             for i, item in enumerate(items):
                 img_bytes: bytes | None = None
                 ext: str | None = None
+                url = self._extract_url_from_item(item)
+                self.root.after(
+                    0,
+                    lambda i=i, total=len(items): self.status_var.set(f"Generating... (processing image {i+1}/{total})"),
+                )
 
                 # 1) Prefer b64_json
                 b64_ok = False
                 try:
                     b64 = self._extract_b64_from_item(item)
-                    candidate = _b64decode_relaxed(b64)
-                    ext = _guess_image_ext(candidate)
-                    if ext:
-                        img_bytes = candidate
-                        b64_ok = True
+                    mime, b64_payload = _split_data_url(b64)
+                    # If provider also provides url, avoid expensive decode on obviously-invalid base64.
+                    if _is_plausible_base64(b64_payload):
+                        candidate = _b64decode_relaxed(b64_payload)
+                        ext = _mime_to_ext(mime) or _guess_image_ext(candidate)
+                        if ext:
+                            img_bytes = candidate
+                            b64_ok = True
                 except Exception:
                     b64_ok = False
 
                 # 2) Fall back to url download if base64 missing/invalid/unknown
                 if not b64_ok:
-                    url = self._extract_url_from_item(item)
                     if not url:
                         raise RuntimeError(f"Provider response item has no usable image payload. item={str(item)[:300]}")
+                    self.root.after(
+                        0,
+                        lambda i=i, total=len(items): self.status_var.set(f"Generating... (downloading image {i+1}/{total})"),
+                    )
                     body, content_type = _download_url_bytes(url)
                     if _looks_like_html(body):
                         snippet = body[:300].decode("utf-8", errors="replace")
@@ -847,8 +921,15 @@ class App:
                 bool(params.images),
                 params.n,
             )
-            self.root.after(0, lambda: self.status_var.set(f"Error: {e} (log: {_log_file_path()})"))
-            self.root.after(0, lambda: messagebox.showerror("Generate failed", f"{e}\n\nSee log: {_log_file_path()}"))
+            # NOTE: In Python 3, exception variables are cleared at the end of the
+            # except block. Capture the message now for Tk callbacks.
+            err_msg = str(e)
+            log_path = _log_file_path()
+            self.root.after(0, lambda msg=err_msg, lp=log_path: self.status_var.set(f"Error: {msg} (log: {lp})"))
+            self.root.after(
+                0,
+                lambda msg=err_msg, lp=log_path: messagebox.showerror("Generate failed", f"{msg}\n\nSee log: {lp}"),
+            )
 
     def run(self) -> None:
         self.root.mainloop()
