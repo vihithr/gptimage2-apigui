@@ -1,5 +1,7 @@
 # GptImage2-APIGUI
 
+Quick language switch: [中文](#中文) | [English](#english)
+
 ## 中文
 
 一个面向 OpenAI 兼容 **图像生成 / 图像编辑** API 的 Windows GUI，支持自定义 provider `base_url`、多会话工作流和打包 `.exe` 发布。
