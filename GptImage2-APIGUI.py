@@ -9,7 +9,7 @@ import threading
 import urllib.request
 from email.message import Message
 from urllib.parse import urlparse, urlunparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tkinter import (
@@ -45,6 +45,8 @@ DEFAULT_CONFIG = {
     # Default output dir (optional). Empty => Pic_generate/image
     "out_dir": "",
     "ui_language": "zh",
+    "connection_presets_json": "{}",
+    "active_preset": "",
 }
 
 TEXTS: dict[str, dict[str, str]] = {
@@ -75,6 +77,24 @@ TEXTS: dict[str, dict[str, str]] = {
         "open_after_save": "保存后打开文件夹",
         "record_session": "记录会话",
         "generate": "生成",
+        "interrupt": "中断当前会话",
+        "send_background": "转后台继续",
+        "save_preset": "保存预设",
+        "rename_preset": "重命名",
+        "delete_preset": "删除预设",
+        "preset": "预设：",
+        "preset_name_prompt": "预设名称：",
+        "preset_name_empty": "预设名称不能为空。",
+        "preset_rename_prompt": "新预设名称：",
+        "preset_name_exists": "预设已存在：{name}",
+        "preset_saved": "已保存预设：{name}",
+        "preset_deleted": "已删除预设：{name}",
+        "preset_not_found": "找不到预设：{name}",
+        "refresh_models": "获取模型",
+        "fetch_models_failed": "获取模型失败：{msg}",
+        "fetching_models": "正在从服务端获取模型列表...",
+        "session_cancelled": "会话已中断（后台请求可能仍在收尾）",
+        "session_moved_bg": "会话已转后台，已创建可继续编辑的新会话。",
         "sessions": "会话管理",
         "new": "新建",
         "duplicate": "复制",
@@ -134,6 +154,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "status_done": "已完成",
         "status_error": "错误",
         "status_unknown": "未知",
+        "status_cancelled": "已中断",
     },
     "en": {
         "window_title": "GPT Image GUI (gpt-image-2)",
@@ -162,6 +183,24 @@ TEXTS: dict[str, dict[str, str]] = {
         "open_after_save": "Open folder after save",
         "record_session": "Record session",
         "generate": "Generate",
+        "interrupt": "Interrupt Session",
+        "send_background": "Send to Background",
+        "save_preset": "Save preset",
+        "rename_preset": "Rename preset",
+        "delete_preset": "Delete preset",
+        "preset": "Preset:",
+        "preset_name_prompt": "Preset name:",
+        "preset_name_empty": "Preset name cannot be empty.",
+        "preset_rename_prompt": "New preset name:",
+        "preset_name_exists": "Preset already exists: {name}",
+        "preset_saved": "Preset saved: {name}",
+        "preset_deleted": "Preset deleted: {name}",
+        "preset_not_found": "Preset not found: {name}",
+        "refresh_models": "Fetch models",
+        "fetch_models_failed": "Fetch models failed: {msg}",
+        "fetching_models": "Fetching model list from provider...",
+        "session_cancelled": "Session interrupted (provider request may still be finalizing in background).",
+        "session_moved_bg": "Session moved to background; a new editable session is ready.",
         "sessions": "Sessions",
         "new": "New",
         "duplicate": "Duplicate",
@@ -221,6 +260,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "status_done": "done",
         "status_error": "error",
         "status_unknown": "unknown",
+        "status_cancelled": "cancelled",
     },
 }
 
@@ -527,6 +567,7 @@ class SessionState:
     current_run_id: int = 0
     run_count: int = 0
     selected_input_index: int | None = None
+    cancelled_run_ids: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.generated_files is None:
@@ -547,6 +588,8 @@ class App:
         self.model_var = StringVar(
             value=_first_non_empty(CONFIG.get("model", ""), os.getenv("OPENAI_IMAGE_MODEL", ""), "gpt-image-2")
         )
+        self._model_choices: list[str] = []
+        self._model_choices_full: list[str] = []
         self.quality_var = StringVar(value="high")
         self.size_var = StringVar(value="1024x1024")
         self.n_var = StringVar(value="1")
@@ -556,6 +599,9 @@ class App:
         self.status_var = StringVar(value=self._t("ready"))
         self.open_out_after_var = IntVar(value=0)
         self.record_session_var = IntVar(value=1)
+        self.preset_var = StringVar(value="")
+        self.connection_presets: dict[str, dict[str, str]] = self._load_connection_presets()
+        self._active_preset_name = (CONFIG.get("active_preset", "") or "").strip()
 
         self._image_preview_photo = None
         self._thumb_photos: list[object] = []
@@ -567,10 +613,61 @@ class App:
         self._thumb_session_id: str | None = None
         self.sessions: list[SessionState] = []
         self.active_session_id: str | None = None
+        self._model_popup: Toplevel | None = None
+        self._model_popup_list: Listbox | None = None
+        self._model_popup_after_id: str | None = None
 
         self._build_ui()
         self._create_initial_session()
         self._auto_load_recent_sessions()
+        if self._active_preset_name and self._active_preset_name in self.connection_presets:
+            self._apply_preset(self._active_preset_name)
+
+    def _load_connection_presets(self) -> dict[str, dict[str, str]]:
+        raw = (CONFIG.get("connection_presets_json", "") or "{}").strip()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except Exception:
+            parsed = {}
+        presets: dict[str, dict[str, str]] = {}
+        if isinstance(parsed, dict):
+            for name, value in parsed.items():
+                name_str = str(name).strip()
+                if not name_str or not isinstance(value, dict):
+                    continue
+                presets[name_str] = {
+                    "api_key": str(value.get("api_key", "")).strip(),
+                    "base_url": _normalize_base_url(str(value.get("base_url", "")).strip()),
+                    "model": str(value.get("model", "")).strip() or "gpt-image-2",
+                }
+                models = value.get("models", [])
+                if isinstance(models, list):
+                    cleaned: list[str] = []
+                    for m in models:
+                        ms = str(m).strip()
+                        if ms:
+                            cleaned.append(ms)
+                    if cleaned:
+                        presets[name_str]["models"] = cleaned
+        return presets
+
+    def _persist_connection_presets(self) -> None:
+        _save_config_values(
+            {
+                "connection_presets_json": json.dumps(self.connection_presets, ensure_ascii=False),
+                "active_preset": self._active_preset_name,
+            }
+        )
+
+    def _persist_form_defaults(self) -> None:
+        _save_config_values(
+            {
+                "api_key": self.api_key_var.get().strip(),
+                "base_url": _normalize_base_url(self.base_url_var.get().strip()),
+                "model": self.model_var.get().strip() or "gpt-image-2",
+                "out_dir": self.out_dir_var.get().strip(),
+            }
+        )
 
     def _lang(self) -> str:
         lang = self.ui_language_var.get().strip().lower()
@@ -589,6 +686,7 @@ class App:
                 "downloading": "status_downloading",
                 "done": "status_done",
                 "error": "status_error",
+                "cancelled": "status_cancelled",
             }.get(state, "status_unknown")
         )
 
@@ -642,7 +740,15 @@ class App:
 
         r = row(top)
         Label(r, text=self._t("model"), width=24, anchor="w").pack(side=LEFT)
-        Entry(r, textvariable=self.model_var, width=30).pack(side=LEFT)
+        self.model_box = ttk.Combobox(r, textvariable=self.model_var, values=self._model_choices, width=30, state="normal")
+        self.model_box.pack(side=LEFT)
+        self.model_box.bind("<KeyRelease>", self.on_model_search_key)
+        self.model_box.bind("<FocusOut>", self.on_model_focus_out)
+        self.model_box.bind("<Escape>", self.on_model_escape)
+        self.model_box.bind("<Down>", self.on_model_down)
+        self.model_box.bind("<Up>", self.on_model_up)
+        self.model_box.bind("<Return>", self.on_model_enter)
+        Button(r, text=self._t("refresh_models"), command=self.on_refresh_models).pack(side=LEFT, padx=(6, 0))
         Label(r, text=self._t("quality"), width=10, anchor="w").pack(side=LEFT, padx=(12, 0))
         ttk.Combobox(r, textvariable=self.quality_var, values=["low", "medium", "high", "auto"], width=10).pack(
             side=LEFT
@@ -656,6 +762,16 @@ class App:
         ).pack(side=LEFT)
         Label(r, text=self._t("n"), width=5, anchor="w").pack(side=LEFT, padx=(12, 0))
         Entry(r, textvariable=self.n_var, width=5).pack(side=LEFT)
+
+        r = row(top)
+        Label(r, text=self._t("preset"), width=24, anchor="w").pack(side=LEFT)
+        self.preset_box = ttk.Combobox(r, textvariable=self.preset_var, values=[], width=30, state="readonly")
+        self.preset_box.pack(side=LEFT)
+        self.preset_box.bind("<<ComboboxSelected>>", self.on_preset_selected)
+        Button(r, text=self._t("save_preset"), command=self.on_save_preset).pack(side=LEFT, padx=(6, 0))
+        Button(r, text=self._t("rename_preset"), command=self.on_rename_preset).pack(side=LEFT, padx=(6, 0))
+        Button(r, text=self._t("delete_preset"), command=self.on_delete_preset).pack(side=LEFT, padx=(6, 0))
+        self._refresh_preset_selector()
 
         mid = Frame(self.root)
         mid.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
@@ -733,6 +849,8 @@ class App:
         run = Frame(output_group)
         run.pack(fill=BOTH, pady=(8, 0))
         Button(run, text=self._t("generate"), command=self.on_generate_clicked, height=2, width=18).pack(side=LEFT)
+        Button(run, text=self._t("interrupt"), command=self.on_interrupt_session, height=2).pack(side=LEFT, padx=(6, 0))
+        Button(run, text=self._t("send_background"), command=self.on_send_background, height=2).pack(side=LEFT, padx=(6, 0))
 
         tools_group = LabelFrame(right, text=self._t("tools"))
         tools_group.pack(fill=X, pady=(8, 0))
@@ -954,6 +1072,7 @@ class App:
             "downloading": "~",
             "done": "+",
             "error": "!",
+            "cancelled": "x",
         }.get(session.status_state, "*")
         result_count = len(session.generated_files)
         suffix = f" | {result_count} result(s)" if result_count else ""
@@ -1087,6 +1206,354 @@ class App:
         self.active_session_id = session_id
         self._load_session_into_form(session)
         self._refresh_sessions_list()
+
+    def _refresh_preset_selector(self) -> None:
+        if not hasattr(self, "preset_box"):
+            return
+        names = sorted(self.connection_presets.keys())
+        self.preset_box.configure(values=names)
+        if self._active_preset_name in self.connection_presets:
+            self.preset_var.set(self._active_preset_name)
+        elif names:
+            self.preset_var.set(names[0])
+        else:
+            self.preset_var.set("")
+
+    def _apply_preset(self, name: str) -> bool:
+        preset = self.connection_presets.get(name)
+        if not preset:
+            return False
+        self.api_key_var.set(preset.get("api_key", ""))
+        self.base_url_var.set(preset.get("base_url", ""))
+        self.model_var.set(preset.get("model", "gpt-image-2"))
+        models = preset.get("models", [])
+        if isinstance(models, list):
+            cleaned = [str(x).strip() for x in models if str(x).strip()]
+            self._model_choices_full = list(dict.fromkeys(cleaned))
+        else:
+            self._model_choices_full = []
+        self._model_choices = list(self._model_choices_full)
+        if hasattr(self, "model_box"):
+            self.model_box.configure(values=self._model_choices)
+        self._active_preset_name = name
+        self.preset_var.set(name)
+        self._persist_connection_presets()
+        self._save_form_into_active_session()
+        return True
+
+    def on_preset_selected(self, _event=None) -> None:
+        name = self.preset_var.get().strip()
+        if not name:
+            return
+        if not self._apply_preset(name):
+            messagebox.showerror(self._t("preset"), self._t("preset_not_found", name=name))
+
+    def on_save_preset(self) -> None:
+        current_name = self.preset_var.get().strip()
+        name = simpledialog.askstring(
+            self._t("save_preset"),
+            self._t("preset_name_prompt"),
+            initialvalue=current_name,
+            parent=self.root,
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showerror(self._t("save_preset"), self._t("preset_name_empty"))
+            return
+        self.connection_presets[name] = {
+            "api_key": self.api_key_var.get().strip(),
+            "base_url": _normalize_base_url(self.base_url_var.get().strip()),
+            "model": self.model_var.get().strip() or "gpt-image-2",
+        }
+        self._active_preset_name = name
+        self._persist_connection_presets()
+        self._refresh_preset_selector()
+        self.status_var.set(self._t("preset_saved", name=name))
+        self._save_form_into_active_session()
+
+    def on_delete_preset(self) -> None:
+        name = self.preset_var.get().strip()
+        if not name:
+            return
+        if name not in self.connection_presets:
+            messagebox.showerror(self._t("delete_preset"), self._t("preset_not_found", name=name))
+            return
+        del self.connection_presets[name]
+        if self._active_preset_name == name:
+            self._active_preset_name = ""
+        self._persist_connection_presets()
+        self._refresh_preset_selector()
+        self.status_var.set(self._t("preset_deleted", name=name))
+
+    def on_rename_preset(self) -> None:
+        old = self.preset_var.get().strip()
+        if not old:
+            return
+        if old not in self.connection_presets:
+            messagebox.showerror(self._t("rename_preset"), self._t("preset_not_found", name=old))
+            return
+        new = simpledialog.askstring(
+            self._t("rename_preset"),
+            self._t("preset_rename_prompt"),
+            initialvalue=old,
+            parent=self.root,
+        )
+        if new is None:
+            return
+        new = new.strip()
+        if not new:
+            messagebox.showerror(self._t("rename_preset"), self._t("preset_name_empty"))
+            return
+        if new != old and new in self.connection_presets:
+            messagebox.showerror(self._t("rename_preset"), self._t("preset_name_exists", name=new))
+            return
+        if new == old:
+            return
+        self.connection_presets[new] = dict(self.connection_presets[old])
+        del self.connection_presets[old]
+        if self._active_preset_name == old:
+            self._active_preset_name = new
+        self._persist_connection_presets()
+        self._refresh_preset_selector()
+        self._apply_preset(new)
+
+    def on_refresh_models(self) -> None:
+        api_key = self.api_key_var.get().strip()
+        base_url = _normalize_base_url(self.base_url_var.get().strip())
+        if not api_key:
+            messagebox.showerror(self._t("invalid_input"), self._t("missing_api_key"))
+            return
+        if self._get_active_session():
+            self.status_var.set(f"{self._get_active_session().title}: {self._t('fetching_models')}")
+        else:
+            self.status_var.set(self._t("fetching_models"))
+        t = threading.Thread(target=self._fetch_models_worker, args=(api_key, base_url), daemon=True)
+        t.start()
+
+    def on_model_search_key(self, _event=None) -> None:
+        # Debounced incremental search: update a non-focus-stealing popup list.
+        # IMPORTANT: ignore navigation/confirm keys; otherwise arrow/enter will
+        # trigger refresh and reset selection.
+        if _event is not None:
+            ks = getattr(_event, "keysym", "") or ""
+            if ks in {"Up", "Down", "Return", "Escape"}:
+                return
+        if self._model_popup_after_id:
+            try:
+                self.root.after_cancel(self._model_popup_after_id)
+            except Exception:
+                pass
+            self._model_popup_after_id = None
+        self._model_popup_after_id = self.root.after(80, self._model_popup_update)
+
+    def _cancel_model_popup_debounce(self) -> None:
+        if self._model_popup_after_id:
+            try:
+                self.root.after_cancel(self._model_popup_after_id)
+            except Exception:
+                pass
+            self._model_popup_after_id = None
+
+    def _model_popup_update(self) -> None:
+        self._model_popup_after_id = None
+        full = list(self._model_choices_full)
+        if not full:
+            self._hide_model_popup()
+            return
+        needle = (self.model_var.get() or "").strip().lower()
+        if not needle:
+            filtered = full[:50]
+        else:
+            filtered = [m for m in full if needle in m.lower()][:50]
+        if not filtered:
+            self._hide_model_popup()
+            return
+        self._show_model_popup(filtered)
+
+    def _show_model_popup(self, items: list[str]) -> None:
+        if not hasattr(self, "model_box"):
+            return
+        if self._model_popup is None or not self._model_popup.winfo_exists():
+            pop = Toplevel(self.root)
+            pop.overrideredirect(True)
+            pop.attributes("-topmost", True)
+            lb = Listbox(pop, height=min(10, max(3, len(items))), exportselection=False)
+            lb.pack(fill=BOTH, expand=True)
+            lb.bind("<ButtonRelease-1>", self.on_model_popup_click)
+            self._model_popup = pop
+            self._model_popup_list = lb
+        else:
+            try:
+                self._model_popup.deiconify()
+            except Exception:
+                pass
+        pop = self._model_popup
+        lb = self._model_popup_list
+        if pop is None or lb is None:
+            return
+
+        # Position right under the combobox entry area.
+        x = self.model_box.winfo_rootx()
+        y = self.model_box.winfo_rooty() + self.model_box.winfo_height()
+        w = self.model_box.winfo_width()
+        pop.geometry(f"{w}x{0}+{x}+{y}")
+
+        lb.delete(0, END)
+        for it in items:
+            lb.insert(END, it)
+        lb.configure(height=min(10, max(3, len(items))))
+        pop.update_idletasks()
+        h = lb.winfo_reqheight()
+        pop.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Keep focus on entry so typing isn't interrupted.
+        try:
+            self.model_box.focus_set()
+        except Exception:
+            pass
+
+    def _hide_model_popup(self) -> None:
+        self._cancel_model_popup_debounce()
+        if self._model_popup and self._model_popup.winfo_exists():
+            try:
+                if self._model_popup_list and self._model_popup_list.winfo_exists():
+                    self._model_popup_list.selection_clear(0, END)
+                self._model_popup.withdraw()
+                self._model_popup.update_idletasks()
+            except Exception:
+                pass
+
+    def _is_model_popup_visible(self) -> bool:
+        return bool(self._model_popup and self._model_popup.winfo_exists() and self._model_popup.state() == "normal")
+
+    def _model_popup_current_list(self) -> list[str]:
+        lb = self._model_popup_list
+        if lb is None or not lb.winfo_exists():
+            return []
+        return [lb.get(i) for i in range(lb.size())]
+
+    def _model_popup_select_index(self, idx: int) -> None:
+        lb = self._model_popup_list
+        if lb is None or not lb.winfo_exists():
+            return
+        if lb.size() <= 0:
+            return
+        idx = max(0, min(idx, lb.size() - 1))
+        lb.selection_clear(0, END)
+        lb.selection_set(idx)
+        lb.activate(idx)
+        lb.see(idx)
+
+    def _model_popup_get_selected(self) -> str | None:
+        lb = self._model_popup_list
+        if lb is None or not lb.winfo_exists():
+            return None
+        sel = list(lb.curselection())
+        if not sel:
+            return None
+        val = lb.get(sel[0])
+        return str(val) if isinstance(val, str) and val.strip() else None
+
+    def on_model_popup_click(self, _event=None) -> None:
+        val = self._model_popup_get_selected()
+        if not val:
+            return
+        self.model_var.set(val)
+        self._hide_model_popup()
+        self._save_form_into_active_session()
+        try:
+            self.model_box.focus_set()
+        except Exception:
+            pass
+
+    def on_model_focus_out(self, _event=None) -> None:
+        # Delay hide so click can register.
+        self.root.after(120, self._hide_model_popup)
+
+    def on_model_escape(self, _event=None) -> None:
+        self._hide_model_popup()
+
+    def on_model_down(self, _event=None) -> str | None:
+        self._cancel_model_popup_debounce()
+        if not self._is_model_popup_visible():
+            self._model_popup_update()
+        if self._is_model_popup_visible():
+            lb = self._model_popup_list
+            if lb and lb.size() > 0:
+                sel = list(lb.curselection())
+                next_idx = (sel[0] + 1) if sel else 0
+                self._model_popup_select_index(next_idx)
+            return "break"
+        return None
+
+    def on_model_up(self, _event=None) -> str | None:
+        self._cancel_model_popup_debounce()
+        if self._is_model_popup_visible():
+            lb = self._model_popup_list
+            if lb and lb.size() > 0:
+                sel = list(lb.curselection())
+                next_idx = (sel[0] - 1) if sel else lb.size() - 1
+                self._model_popup_select_index(next_idx)
+            return "break"
+        return None
+
+    def on_model_enter(self, _event=None) -> str | None:
+        self._cancel_model_popup_debounce()
+        if self._is_model_popup_visible():
+            val = self._model_popup_get_selected()
+            if val:
+                self.model_var.set(val)
+            self._hide_model_popup()
+            self._save_form_into_active_session()
+            return "break"
+        return None
+
+    def _fetch_models_worker(self, api_key: str, base_url: str) -> None:
+        try:
+            client = OpenAI(api_key=api_key, base_url=base_url)
+            resp = client.models.list()
+            models: list[str] = []
+            data = getattr(resp, "data", None)
+            if isinstance(data, list):
+                for item in data:
+                    mid = getattr(item, "id", None)
+                    if isinstance(mid, str) and mid.strip():
+                        models.append(mid.strip())
+            models = sorted(set(models))
+            if not models:
+                raise RuntimeError("Provider returned an empty model list.")
+
+            def _apply() -> None:
+                self._model_choices = models
+                self._model_choices_full = list(models)
+                if hasattr(self, "model_box"):
+                    self.model_box.configure(values=models)
+                # Bind/persist into active preset if any
+                if self._active_preset_name and self._active_preset_name in self.connection_presets:
+                    self.connection_presets[self._active_preset_name]["models"] = list(models)
+                    self._persist_connection_presets()
+                self._save_form_into_active_session()
+                active = self._get_active_session()
+                if active:
+                    self.status_var.set(f"{active.title}: {self._t('ready')}")
+                else:
+                    self.status_var.set(self._t("ready"))
+
+            self.root.after(0, _apply)
+        except Exception as e:
+            msg = str(e)
+
+            def _fail() -> None:
+                messagebox.showerror(self._t("refresh_models"), self._t("fetch_models_failed", msg=msg))
+                active = self._get_active_session()
+                if active:
+                    self.status_var.set(f"{active.title}: {active.status_detail or self._t('ready')}")
+                else:
+                    self.status_var.set(self._t("ready"))
+
+            self.root.after(0, _fail)
 
     def _current_selected_input_index(self) -> int | None:
         idxs = list(self.images_list.curselection())
@@ -1445,6 +1912,7 @@ class App:
 
     def _collect_params(self) -> GenerateParams:
         session = self._save_form_into_active_session()
+        self._persist_form_defaults()
         prompt = self.prompt_text.get("1.0", END).strip()
         if not prompt:
             raise ValueError(self._t("prompt_empty"))
@@ -1501,6 +1969,7 @@ class App:
         should_record_session = session.record_session
         session.run_count += 1
         session.current_run_id = session.run_count
+        session.cancelled_run_ids.discard(session.current_run_id)
         session.running = True
         session.last_error = ""
         session.status_state = "running"
@@ -1514,6 +1983,45 @@ class App:
             daemon=True,
         )
         t.start()
+
+    def _is_run_cancelled(self, session_id: str, run_id: int) -> bool:
+        session = self._get_session(session_id)
+        if not session:
+            return True
+        return run_id in session.cancelled_run_ids
+
+    def _raise_if_cancelled(self, session_id: str, run_id: int) -> None:
+        if self._is_run_cancelled(session_id, run_id):
+            raise RuntimeError("__SESSION_CANCELLED__")
+
+    def on_interrupt_session(self) -> None:
+        session = self._get_active_session()
+        if not session or not session.running:
+            return
+        run_id = session.current_run_id
+        session.cancelled_run_ids.add(run_id)
+        session.running = False
+        session.status_state = "cancelled"
+        session.status_detail = self._t("session_cancelled")
+        self.status_var.set(f"{session.title}: {session.status_detail}")
+        self._refresh_sessions_list()
+
+    def on_send_background(self) -> None:
+        session = self._get_active_session()
+        if not session:
+            return
+        if not session.running:
+            return
+        background_title = session.title if session.title.endswith(" [BG]") else f"{session.title} [BG]"
+        session.title = background_title
+        self._refresh_sessions_list()
+        follow_up = self._create_session(from_session=session, title=f"{session.title.replace(' [BG]', '')} Continue")
+        follow_up.running = False
+        follow_up.status_state = "idle"
+        follow_up.status_detail = self._t("ready")
+        follow_up.cancelled_run_ids.clear()
+        self._set_active_session(follow_up.session_id)
+        self.status_var.set(f"{follow_up.title}: {self._t('session_moved_bg')}")
 
     def _save_session(self, params: GenerateParams, saved_files: list[str]) -> Path:
         _safe_mkdir(_sessions_dir())
@@ -1604,6 +2112,7 @@ class App:
         should_record_session: bool,
     ) -> None:
         try:
+            self._raise_if_cancelled(session_id, run_id)
             _safe_mkdir(params.out_dir)
             client = OpenAI(api_key=params.api_key, base_url=params.base_url)
             self.root.after(
@@ -1612,6 +2121,7 @@ class App:
                     sid, rid, state="running", detail=self._t("waiting_provider"), running=True
                 ),
             )
+            self._raise_if_cancelled(session_id, run_id)
 
             if params.images:
                 # image-to-image
@@ -1642,6 +2152,7 @@ class App:
             items = self._extract_response_items(resp)
             saved: list[str] = []
             for i, item in enumerate(items):
+                self._raise_if_cancelled(session_id, run_id)
                 img_bytes: bytes | None = None
                 ext: str | None = None
                 url = self._extract_url_from_item(item)
@@ -1708,6 +2219,7 @@ class App:
 
             session_hint = ""
             session_file_str = ""
+            self._raise_if_cancelled(session_id, run_id)
             if should_record_session:
                 session_file = self._save_session(params, saved)
                 session_file_str = str(session_file)
@@ -1729,6 +2241,18 @@ class App:
             if should_open_out:
                 self.root.after(0, lambda out_dir=params.out_dir: _open_folder(out_dir))
         except Exception as e:
+            if str(e) == "__SESSION_CANCELLED__":
+                self.root.after(
+                    0,
+                    lambda sid=session_id, rid=run_id: self._update_session_state(
+                        sid,
+                        rid,
+                        state="cancelled",
+                        detail=self._t("session_cancelled"),
+                        running=False,
+                    ),
+                )
+                return
             LOGGER.exception(
                 "Generate failed | base_url=%s model=%s has_images=%s n=%s",
                 params.base_url,

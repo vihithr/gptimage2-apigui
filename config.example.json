@@ -2,5 +2,8 @@
   "api_key": "",
   "base_url": "https://api.openai.com/v1",
   "model": "gpt-image-2",
-  "out_dir": "image"
+  "out_dir": "image",
+  "ui_language": "zh",
+  "connection_presets_json": "{}",
+  "active_preset": ""
 }
