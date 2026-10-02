@@ -608,10 +608,12 @@ class App:
         self._thumb_labels: list[Label] = []
         self._pillow_available = self._check_pillow()
         self._result_thumb_photo = None
+        self._result_thumb_cache: dict[tuple[str, object], object] = {}
         self._loading_session = False
         self._thumb_request_id = 0
         self._thumb_session_id: str | None = None
         self.sessions: list[SessionState] = []
+        self._sessions_list_rendered: list[str] = []
         self.active_session_id: str | None = None
         self._model_popup: Toplevel | None = None
         self._model_popup_list: Listbox | None = None
@@ -875,6 +877,8 @@ class App:
         list_wrap.pack(fill=BOTH, expand=True)
         self.sessions_list = Listbox(list_wrap, height=10)
         self.sessions_list.pack(side=LEFT, fill=BOTH, expand=True)
+        # A rebuilt widget starts empty, so the diff cache must be dropped with it.
+        self._sessions_list_rendered = []
         sessions_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=self.sessions_list.yview)
         sessions_scroll.pack(side=RIGHT, fill="y")
         self.sessions_list.configure(yscrollcommand=sessions_scroll.set)
@@ -971,14 +975,7 @@ class App:
         session = self._create_session(title="Session 1")
         self._set_active_session(session.session_id)
 
-    def _session_exists_for_path(self, path: Path) -> bool:
-        target = str(path.resolve())
-        for session in self.sessions:
-            if session.imported_from_path and session.imported_from_path == target:
-                return True
-        return False
-
-    def _import_session_file(self, path: Path, *, activate: bool) -> SessionState | None:
+    def _import_session_file(self, path: Path, *, activate: bool, refresh: bool = True) -> SessionState | None:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
@@ -1015,7 +1012,7 @@ class App:
             self.sessions.append(session)
             if activate:
                 self._set_active_session(session.session_id)
-            else:
+            elif refresh:
                 self._refresh_sessions_list()
             if session.generated_files:
                 session.status_detail = self._t("session_imported_results", count=len(session.generated_files))
@@ -1032,15 +1029,20 @@ class App:
         if limit is not None:
             paths = paths[:limit]
 
+        seen = {s.imported_from_path for s in self.sessions if s.imported_from_path}
         loaded = 0
         latest_loaded: SessionState | None = None
         for path in paths:
-            if self._session_exists_for_path(path):
+            target = str(path.resolve())
+            if target in seen:
                 continue
-            session = self._import_session_file(path, activate=False)
+            seen.add(target)
+            session = self._import_session_file(path, activate=False, refresh=False)
             if session:
                 loaded += 1
                 latest_loaded = session
+        if loaded:
+            self._refresh_sessions_list()
         if activate_latest and latest_loaded:
             self._set_active_session(latest_loaded.session_id)
         return loaded
@@ -1085,9 +1087,18 @@ class App:
     def _refresh_sessions_list(self) -> None:
         if not hasattr(self, "sessions_list"):
             return
-        self.sessions_list.delete(0, END)
-        for session in self.sessions:
-            self.sessions_list.insert(END, self._session_display_text(session))
+        texts = [self._session_display_text(session) for session in self.sessions]
+        rendered = self._sessions_list_rendered
+        if len(rendered) != len(texts):
+            self.sessions_list.delete(0, END)
+            for text in texts:
+                self.sessions_list.insert(END, text)
+        else:
+            for i, (old, new) in enumerate(zip(rendered, texts)):
+                if old != new:
+                    self.sessions_list.delete(i)
+                    self.sessions_list.insert(i, new)
+        self._sessions_list_rendered = texts
         active = self._get_active_session()
         if active:
             idx = self.sessions.index(active)
@@ -1134,16 +1145,32 @@ class App:
             self._result_thumb_photo = None
             return
         try:
-            from PIL import Image, ImageTk  # type: ignore
-
-            img = Image.open(latest)
-            img.thumbnail((100, 100))
-            tk_img = ImageTk.PhotoImage(img)
+            tk_img = self._result_thumb_image(latest)
             self._result_thumb_photo = tk_img
             self.session_result_thumb.configure(image=tk_img, text="")
         except Exception:
             self.session_result_thumb.configure(image="", text=self._t("preview_failed"))
             self._result_thumb_photo = None
+
+    # Decoding a 3 MB result PNG to a 100x100 thumbnail costs ~25 ms on the UI
+    # thread, and the summary panel is refreshed on every state change.
+    _RESULT_THUMB_CACHE_MAX = 16
+
+    def _result_thumb_image(self, path: Path) -> object:
+        from PIL import Image, ImageTk  # type: ignore
+
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        cached = self._result_thumb_cache.get(key)
+        if cached is not None:
+            return cached
+        with Image.open(path) as img:
+            img.thumbnail((100, 100))
+            tk_img = ImageTk.PhotoImage(img)
+        self._result_thumb_cache[key] = tk_img
+        while len(self._result_thumb_cache) > self._RESULT_THUMB_CACHE_MAX:
+            self._result_thumb_cache.pop(next(iter(self._result_thumb_cache)))
+        return tk_img
 
     def _load_session_into_form(self, session: SessionState) -> None:
         self._loading_session = True
