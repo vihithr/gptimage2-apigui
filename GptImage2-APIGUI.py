@@ -1175,7 +1175,9 @@ class App:
     def _load_session_into_form(self, session: SessionState) -> None:
         self._loading_session = True
         try:
-            self.api_key_var.set(session.api_key)
+            self.api_key_var.set(
+                _first_non_empty(session.api_key, CONFIG.get("api_key", ""), os.getenv("OPENAI_API_KEY", ""))
+            )
             self.base_url_var.set(session.base_url)
             self.model_var.set(session.model)
             self.quality_var.set(session.quality)
@@ -2057,7 +2059,8 @@ class App:
         payload = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "params": {
-                "api_key": params.api_key,
+                # No api_key here on purpose: the key comes from config.json or the active
+                # preset at run time, so storing it per session only multiplies plaintext copies.
                 "base_url": params.base_url,
                 "model": params.model,
                 "prompt": params.prompt,
