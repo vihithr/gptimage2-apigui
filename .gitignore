@@ -14,7 +14,9 @@ Pic_generate/
 # Build outputs
 build/
 dist/
+# CI builds from the tracked spec, so it must not be ignored.
 *.spec
+!GptImage2-APIGUI.spec
 
 # OS / IDE
 .DS_Store

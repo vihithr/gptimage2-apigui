@@ -1,0 +1,55 @@
+name: Build Windows exe
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: pyinstaller --clean --noconfirm GptImage2-APIGUI.spec
+
+      # A PyInstaller build can silently omit the Tcl/Tk DLLs, which produces an
+      # exe that dies at import time with "DLL load failed while importing _tkinter".
+      - name: Verify Tcl/Tk got bundled
+        shell: bash
+        run: |
+          toc=build/GptImage2-APIGUI/EXE-00.toc
+          test -f "$toc" || { echo "::error::missing $toc"; exit 1; }
+          for dll in tcl86 tk86; do
+            grep -qiE "$dll" "$toc" || { echo "::error::$dll was not bundled"; exit 1; }
+          done
+          test -f dist/GptImage2-APIGUI.exe || { echo "::error::exe missing"; exit 1; }
+          echo "bundled ok: $(wc -c < dist/GptImage2-APIGUI.exe) bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GptImage2-APIGUI
+          path: dist/GptImage2-APIGUI.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          gh release create "$tag" dist/GptImage2-APIGUI.exe --title "$tag" --generate-notes \
+            || gh release upload "$tag" dist/GptImage2-APIGUI.exe --clobber
