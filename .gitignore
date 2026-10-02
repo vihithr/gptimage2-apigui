@@ -11,6 +11,10 @@ sessions/
 image/
 Pic_generate/
 
+# Local art references, not part of the app
+Buffer/
+奶V.png
+
 # Build outputs
 build/
 dist/
