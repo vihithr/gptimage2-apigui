@@ -175,3 +175,9 @@ Output:
 ### Security
 
 Do **NOT** commit `config.json` to git. This repository ignores it by default.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
