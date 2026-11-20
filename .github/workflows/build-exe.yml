@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-build.txt
 
       - name: Build with PyInstaller
         run: pyinstaller --clean --noconfirm GptImage2-APIGUI.spec

@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import urllib.request
@@ -47,6 +48,8 @@ DEFAULT_CONFIG = {
     "ui_language": "zh",
     "connection_presets_json": "{}",
     "active_preset": "",
+    # Per-request timeout (seconds) for provider calls. Empty/invalid => SDK default.
+    "request_timeout": "300",
 }
 
 TEXTS: dict[str, dict[str, str]] = {
@@ -265,8 +268,43 @@ TEXTS: dict[str, dict[str, str]] = {
 }
 
 
+def _migrate_portable_data(base: Path) -> None:
+    """Copy config.json / sessions / logs from the exe directory (the pre-2.x
+    location) into `base` when they do not exist there yet. Best effort only."""
+    legacy = Path(sys.executable).resolve().parent
+    if legacy == base:
+        return
+    cfg_src = legacy / "config.json"
+    cfg_dst = base / "config.json"
+    if not cfg_dst.exists() and cfg_src.is_file():
+        try:
+            cfg_dst.write_bytes(cfg_src.read_bytes())
+        except OSError:
+            pass
+    for name in ("sessions", "logs"):
+        src = legacy / name
+        dst = base / name
+        if src.is_dir() and not dst.exists():
+            try:
+                shutil.copytree(src, dst)
+            except OSError:
+                pass
+
+
 def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
+        # The exe directory is often read-only (e.g. Program Files), which used to
+        # break config/log/session writes. Keep mutable data under %APPDATA%
+        # instead. Set GPTIMAGE2_PORTABLE=1 to keep everything next to the exe.
+        appdata = None if os.environ.get("GPTIMAGE2_PORTABLE") else os.environ.get("APPDATA")
+        if appdata:
+            base = Path(appdata) / "GptImage2-APIGUI"
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return Path(sys.executable).resolve().parent
+            _migrate_portable_data(base)
+            return base
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
@@ -339,6 +377,17 @@ def _first_non_empty(*vals: str) -> str:
         if v:
             return v
     return ""
+
+
+def _request_timeout_s() -> float | None:
+    raw = (CONFIG.get("request_timeout") or "").strip()
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return val if val > 0 else None
 
 
 def _open_folder(path: Path) -> None:
@@ -1541,7 +1590,7 @@ class App:
 
     def _fetch_models_worker(self, api_key: str, base_url: str) -> None:
         try:
-            client = OpenAI(api_key=api_key, base_url=base_url)
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=_request_timeout_s())
             resp = client.models.list()
             models: list[str] = []
             data = getattr(resp, "data", None)
@@ -2144,7 +2193,7 @@ class App:
         try:
             self._raise_if_cancelled(session_id, run_id)
             _safe_mkdir(params.out_dir)
-            client = OpenAI(api_key=params.api_key, base_url=params.base_url)
+            client = OpenAI(api_key=params.api_key, base_url=params.base_url, timeout=_request_timeout_s())
             self.root.after(
                 0,
                 lambda sid=session_id, rid=run_id: self._update_session_state(
