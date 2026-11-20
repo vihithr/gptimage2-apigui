@@ -47,6 +47,7 @@ python -m venv .venv
 - `ui_language`: 可选，`zh` 或 `en`
 - `connection_presets_json`: 可选，保存多个 provider 连接预设
 - `active_preset`: 可选，启动时自动应用的预设名称
+- `request_timeout`: 可选，provider 请求超时（秒），默认 `300`；留空则使用 SDK 默认值
 
 #### 3) 启动
 
@@ -57,6 +58,7 @@ python -m venv .venv
 ### 打包
 
 ```powershell
+.\.venv\Scripts\python -m pip install -r requirements-build.txt
 .\.venv\Scripts\pyinstaller --clean --noconfirm "GptImage2-APIGUI.spec"
 ```
 
@@ -83,6 +85,7 @@ python -m venv .venv
 ### 说明与排错
 
 - 如果出现错误，请查看 `logs/app.log`
+- 数据目录：源码运行时，`config.json` / `sessions/` / `logs/` 位于脚本目录；打包版（exe）默认改用 `%APPDATA%\GptImage2-APIGUI\`，首次启动会自动迁移 exe 目录下的旧数据。设置环境变量 `GPTIMAGE2_PORTABLE=1` 可改回便携模式（数据放在 exe 旁）
 - 如果 provider 返回 **HTML** 或非 JSON，通常说明 `base_url` 不正确（不是 API 端点）或缺少 `/v1`
 - 有些 provider 返回 `b64_json`，有些返回图片 `url`，有些返回 `data:image/...;base64,...`；本工具兼容这三种格式
 - 启动时会自动从 `sessions/` 导入最近会话文件
@@ -132,6 +135,7 @@ Copy `config.example.json` to `config.json` and fill your settings:
 - `ui_language`: optional, `zh` or `en`
 - `connection_presets_json`: optional, stores multiple provider presets
 - `active_preset`: optional preset name to auto-apply on startup
+- `request_timeout`: optional, provider request timeout in seconds, default `300`; leave empty for the SDK default
 
 #### 3) Start
 
@@ -142,6 +146,7 @@ Copy `config.example.json` to `config.json` and fill your settings:
 ### Build
 
 ```powershell
+.\.venv\Scripts\python -m pip install -r requirements-build.txt
 .\.venv\Scripts\pyinstaller --clean --noconfirm "GptImage2-APIGUI.spec"
 ```
 
@@ -168,6 +173,7 @@ Output:
 ### Notes / Troubleshooting
 
 - If you see errors, check `logs/app.log`.
+- Data location: when running from source, `config.json` / `sessions/` / `logs/` live next to the script; the packaged exe stores them under `%APPDATA%\GptImage2-APIGUI\` by default and migrates legacy files from the exe folder on first launch. Set `GPTIMAGE2_PORTABLE=1` to keep everything next to the exe instead.
 - If your provider returns **HTML** or non-JSON, it usually means the `base_url` is wrong (not an API endpoint) or missing `/v1`.
 - Some providers return `b64_json`, some return image `url`, and some return `data:image/...;base64,...`; this app handles all three formats.
 - Recent session files are auto-imported on startup from `sessions/`.

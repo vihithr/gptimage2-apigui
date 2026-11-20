@@ -5,5 +5,6 @@
   "out_dir": "image",
   "ui_language": "zh",
   "connection_presets_json": "{}",
-  "active_preset": ""
+  "active_preset": "",
+  "request_timeout": "300"
 }
